@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-ROBÔ DE OFERTAS E CUPONS - VERSÃO DEFENSIVA REVISADA
-"""
-
 import os
 import time
 import json
@@ -12,16 +8,16 @@ import hashlib
 import threading
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from flask import Flask, request, render_template_string, redirect, jsonify
 
 load_dotenv()
 
 # ============================================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES FIXAS E FLASK
 # ============================================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -30,340 +26,263 @@ TELEGRAM_GRUPOS = [g.strip() for g in os.getenv("TELEGRAM_GRUPOS", "").split(","
 TODOS_DESTINOS = list(dict.fromkeys(TELEGRAM_CANAIS + TELEGRAM_GRUPOS))
 
 RSS_FEED_URL = os.getenv("RSS_FEED_URL", "https://www.promobit.com.br/feed/").strip()
-AFFILIATE_TAG_AMAZON = os.getenv("AFFILIATE_TAG_AMAZON", "").strip()
-AFFILIATE_TAG_OUTROS = os.getenv("AFFILIATE_TAG_OUTROS", "").strip()
-
-INTERVALO_VERIFICACAO = int(os.getenv("INTERVALO_VERIFICACAO", "120"))  # Em minutos
-
-REQUEST_TIMEOUT = 15
-TELEGRAM_TIMEOUT = 15
+INTERVALO_VERIFICACAO = int(os.getenv("INTERVALO_VERIFICACAO", "120"))
 
 POSTED_FILE = "postados.txt"
 CUPONS_FILE = "cupons_postados.txt"
 DADOS_SITE = "dados.json"
-MAX_IDS_HISTORICO = 5000 
+CONFIG_FILE = "config.json"
+MAX_IDS_HISTORICO = 5000
+
+app = Flask(__name__)
+
+# Status Global do Bot para o Dashboard
+bot_status = {
+    "status": "Iniciando...",
+    "ultima_execucao": "N/A",
+    "ofertas_enviadas_hoje": 0,
+    "erros_recentes": []
+}
 
 # ============================================================================
-# SERVIDOR KEEP-ALIVE PARA REPLIT E UPTIMEROBOT
+# GERENCIADOR DE CONFIGURAÇÃO DINÂMICA (AFILIADOS)
 # ============================================================================
 
-class KeepAliveHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Bot is alive and running!")
+def load_dynamic_config():
+    """Carrega as tags de afiliado do JSON. Se não existir, usa as do .env como fallback inicial."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
     
-    def log_message(self, format, *args):
-        # Silencia logs HTTP para não poluir o terminal
-        pass
+    # Configuração padrão (Fallback)
+    default_config = {
+        "amazon_tag": os.getenv("AFFILIATE_TAG_AMAZON", ""),
+        "mercado_livre_tag": os.getenv("AFFILIATE_TAG_OUTROS", "")
+    }
+    save_dynamic_config(default_config)
+    return default_config
 
-def run_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), KeepAliveHandler)
-    server.serve_forever()
-
-def keep_alive():
-    t = threading.Thread(target=run_server)
-    t.daemon = True
-    t.start()
-    log_message("Servidor Keep-Alive iniciado.")
+def save_dynamic_config(config_data):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, indent=4)
 
 # ============================================================================
-# FUNÇÕES AUXILIARES E DE SEGURANÇA
+# FUNÇÕES DO BOT (Lógica de Extração e Envio)
 # ============================================================================
 
 def log_message(message: str, level: str = "INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [{level}] {message}")
+    log_str = f"[{timestamp}] [{level}] {message}"
+    print(log_str)
+    
+    if level == "ERROR":
+        bot_status["erros_recentes"].insert(0, log_str)
+        bot_status["erros_recentes"] = bot_status["erros_recentes"][:5]
 
 def safe_tg_html(text: str) -> str:
-    """Escapa apenas o estritamente necessário para o Telegram não quebrar o HTML."""
-    if not text:
-        return ""
+    if not text: return ""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def load_posted_ids(filename: str) -> list:
-    """Carrega os IDs mantendo a ordem de inserção (cronológica)."""
-    if not os.path.exists(filename):
-        return []
+    if not os.path.exists(filename): return []
     try:
         with open(filename, "r", encoding="utf-8") as f:
             ids = [line.strip() for line in f if line.strip()]
-            # Remove duplicatas preservando a ordem
-            ids = list(dict.fromkeys(ids))
-            log_message(f"Carregados {len(ids)} IDs de {filename}")
-            return ids
-    except Exception as e:
-        log_message(f"Erro ao ler {filename}: {e}", "ERROR")
-        return []
+            return list(dict.fromkeys(ids))
+    except Exception: return []
 
 def save_posted_ids(ids: list, filename: str):
-    """Salva a lista mantendo apenas os mais recentes com fatiamento seguro."""
     try:
         trimmed_ids = ids[-MAX_IDS_HISTORICO:]
         with open(filename, "w", encoding="utf-8") as f:
             for item_id in trimmed_ids:
                 f.write(f"{item_id}\n")
-    except Exception as e:
-        log_message(f"Erro ao salvar histórico em {filename}: {e}", "ERROR")
+    except Exception: pass
 
 def generate_unique_id(text: str, url: str) -> str:
     combined = f"{text.strip()}|{url.strip()}".lower()
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
 
-def convert_to_affiliate_link(url: str) -> str:
-    if not url or not isinstance(url, str):
-        return url
+def convert_to_affiliate_link(url: str, config: dict) -> str:
+    if not url or not isinstance(url, str): return url
     try:
         parsed = urlparse(url)
         hostname = (parsed.netloc or "").lower()
 
         if any(hostname == domain or hostname.endswith(f".{domain}") for domain in ["amazon.com.br", "amazon.com"]):
-            if AFFILIATE_TAG_AMAZON:
+            if config.get("amazon_tag"):
                 query_params = parse_qs(parsed.query)
-                query_params["tag"] = [AFFILIATE_TAG_AMAZON]
-                new_query = urlencode(query_params, doseq=True)
-                return urlunparse(parsed._replace(query=new_query))
+                query_params["tag"] = [config["amazon_tag"]]
+                return urlunparse(parsed._replace(query=urlencode(query_params, doseq=True)))
 
         elif any(hostname == domain or hostname.endswith(f".{domain}") for domain in ["mercadolivre.com.br", "mercadolivre.com"]):
-            if AFFILIATE_TAG_OUTROS:
+            if config.get("mercado_livre_tag"):
                 query_params = parse_qs(parsed.query)
-                query_params["utm_source"] = ["robo_ofertas"]
-                new_query = urlencode(query_params, doseq=True)
-                return urlunparse(parsed._replace(query=new_query))
+                query_params["utm_source"] = [config["mercado_livre_tag"]]
+                return urlunparse(parsed._replace(query=urlencode(query_params, doseq=True)))
 
         return url
-    except Exception as e:
-        log_message(f"Erro ao processar URL para afiliado: {e}", "ERROR")
-        return url
+    except Exception: return url
 
 def send_telegram_message(text_html: str, chat_ids: list) -> tuple:
-    if not TELEGRAM_BOT_TOKEN or not chat_ids:
-        return (0, 0)
-
+    if not TELEGRAM_BOT_TOKEN or not chat_ids: return (0, 0)
     enviados, falhas = 0, 0
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     for chat_id in chat_ids:
         try:
-            payload = {
-                "chat_id": chat_id,
-                "text": text_html,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False
-            }
-            response = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT)
-
+            payload = {"chat_id": chat_id, "text": text_html, "parse_mode": "HTML"}
+            response = requests.post(url, json=payload, timeout=15)
             if response.status_code == 200:
                 enviados += 1
-                log_message(f"Mensagem enviada com sucesso para {chat_id}")
             elif response.status_code == 429:
-                falhas += 1
-                retry_after = response.json().get("parameters", {}).get("retry_after", 5)
-                log_message(f"Rate limit atingido. Aguardando {retry_after}s...", "WARN")
-                time.sleep(retry_after)
-                # Tenta enviar novamente após aguardar
-                requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT)
-            else:
-                falhas += 1
-                log_message(f"Falha ao enviar para {chat_id}: status {response.status_code} - {response.text}", "ERROR")
-
-            time.sleep(1) # Limite seguro do Telegram: ~1 msg por segundo por chat
-
-        except requests.exceptions.RequestException as e:
+                time.sleep(response.json().get("parameters", {}).get("retry_after", 5))
+                requests.post(url, json=payload, timeout=15)
+            time.sleep(1)
+        except Exception as e:
+            log_message(f"Erro Telegram: {e}", "ERROR")
             falhas += 1
-            log_message(f"Erro de conexão ao enviar para {chat_id}: {e}", "ERROR")
-
     return (enviados, falhas)
 
-# ============================================================================
-# EXTRAÇÃO E SCRAPING
-# ============================================================================
-
-def fetch_rss_feed(url: str) -> list:
-    try:
-        log_message(f"Buscando feed RSS: {url}")
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-
-        feed = feedparser.parse(response.content)
-        log_message(f"Feed carregado: {len(feed.entries)} entradas")
-        return feed.entries
-    except Exception as e:
-        log_message(f"Erro ao obter feed RSS: {e}", "ERROR")
-        return []
-
-def scrape_cupons_mercado_livre() -> list:
-    cupons = []
-    try:
-        log_message("Buscando cupons do Mercado Livre...")
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-        response = requests.get("https://www.mercadolivre.com.br/cupons", headers=headers, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.content, "lxml")
-        elementos = soup.find_all(class_=lambda x: bool(x and "coupon" in x.lower()))
-
-        for elem in elementos[:10]:
-            texto = elem.get_text(separator=" ", strip=True)
-            if not texto:
-                continue
-
-            cupons.append({
-                "titulo": texto[:120],
-                "codigo": "",
-                "loja": "Mercado Livre",
-                "link": "https://www.mercadolivre.com.br/cupons",
-                "desconto": ""
-            })
-
-        log_message(f"Encontrados {len(cupons)} elementos de cupom")
-    except Exception as e:
-        log_message(f"Falha ao raspar cupons do ML: {e}", "WARN")
-
-    return cupons
-
-# ============================================================================
-# PERSISTÊNCIA DOS DADOS DO SITE
-# ============================================================================
-
-def load_site_data() -> dict:
-    if os.path.exists(DADOS_SITE):
-        try:
-            with open(DADOS_SITE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"ofertas": [], "cupons": [], "atualizado_em": ""}
-
-def save_site_data(ofertas: list, cupons: list):
-    try:
-        dados = {
-            "ofertas": ofertas[:50],
-            "cupons": cupons[:50],
-            "atualizado_em": datetime.now().isoformat(),
-            "total_ofertas": len(ofertas),
-            "total_cupons": len(cupons)
-        }
-        with open(DADOS_SITE, "w", encoding="utf-8") as f:
-            json.dump(dados, f, ensure_ascii=False, indent=2)
-        log_message(f"Dados atualizados salvos em {DADOS_SITE}")
-    except Exception as e:
-        log_message(f"Erro ao salvar {DADOS_SITE}: {e}", "ERROR")
-
-# ============================================================================
-# CICLO PRINCIPAL
-# ============================================================================
-
 def executar_ciclo():
-    log_message("=== Iniciando ciclo de verificação ===")
-
+    bot_status["status"] = "Buscando ofertas..."
+    config = load_dynamic_config() # Lê as tags mais recentes configuradas no painel
+    
     posted_ids = load_posted_ids(POSTED_FILE)
     cupons_ids = load_posted_ids(CUPONS_FILE)
-    site_data = load_site_data()
-
-    ofertas_lista = site_data.get("ofertas", [])
-    cupons_lista = site_data.get("cupons", [])
-
-    # 1. Processar Ofertas RSS
-    entries = fetch_rss_feed(RSS_FEED_URL)
     
-    # Processamos em reverso para que as mais antigas entrem primeiro e as mais novas fiquem no topo
-    for entry in reversed(entries):
-        try:
-            raw_title = entry.get("title", "Oferta sem título")
+    # Processar Ofertas RSS
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(RSS_FEED_URL, headers=headers, timeout=15)
+        feed = feedparser.parse(resp.content)
+        
+        for entry in reversed(feed.entries):
+            raw_title = entry.get("title", "Oferta")
             link = entry.get("link", "").strip()
-            entry_id = entry.get("id") or entry.get("guid") or link
-
-            if not entry_id or not link.startswith("http"):
-                continue
-
+            entry_id = entry.get("id") or link
             unique_id = generate_unique_id(raw_title, entry_id)
 
-            if unique_id not in posted_ids:
-                affiliate_link = convert_to_affiliate_link(link)
-
-                safe_title = safe_tg_html(raw_title)
-                safe_link = affiliate_link
-
-                msg = (
-                    f"🎁 <b>PROMOÇÃO</b>\n\n"
-                    f"<b>{safe_title}</b>\n\n"
-                    f"🔗 <a href='{safe_link}'>Ver Oferta</a>"
-                )
-
-                enviados, _ = send_telegram_message(msg, TODOS_DESTINOS)
-                if enviados > 0:
+            if unique_id not in posted_ids and link.startswith("http"):
+                affiliate_link = convert_to_affiliate_link(link, config)
+                msg = f"🎁 <b>PROMOÇÃO</b>\n\n<b>{safe_tg_html(raw_title)}</b>\n\n🔗 <a href='{affiliate_link}'>Ver Oferta</a>"
+                env, _ = send_telegram_message(msg, TODOS_DESTINOS)
+                if env > 0:
                     posted_ids.append(unique_id)
-                    ofertas_lista.insert(0, {
-                        "id": unique_id,
-                        "titulo": raw_title,
-                        "link": affiliate_link,
-                        "data": datetime.now().isoformat(),
-                        "fonte": "RSS Feed"
-                    })
-        except Exception as e:
-            log_message(f"Erro ao processar item do RSS: {e}", "ERROR")
+                    bot_status["ofertas_enviadas_hoje"] += 1
+    except Exception as e:
+        log_message(f"Erro no feed: {e}", "ERROR")
 
-    # 2. Processar Cupons
-    cupons = scrape_cupons_mercado_livre()
-    for cupom in reversed(cupons):
-        try:
-            raw_titulo = cupom.get("titulo", "")
-            raw_loja = cupom.get("loja", "Loja")
-            raw_link = cupom.get("link", "")
-            cupom_id = generate_unique_id(raw_titulo, raw_link)
-
-            if cupom_id not in cupons_ids:
-                safe_titulo = safe_tg_html(raw_titulo)
-                safe_loja = safe_tg_html(raw_loja)
-                safe_link = raw_link
-
-                msg = (
-                    f"🎟️ <b>CUPOM DISPONÍVEL</b>\n\n"
-                    f"🏪 <b>Loja:</b> {safe_loja}\n"
-                    f"<b>Descrição:</b> {safe_titulo}\n\n"
-                    f"🔗 <a href='{safe_link}'>Acessar Cupons</a>"
-                )
-
-                enviados, _ = send_telegram_message(msg, TODOS_DESTINOS)
-                if enviados > 0:
-                    cupons_ids.append(cupom_id)
-                    cupons_lista.insert(0, {
-                        "id": cupom_id,
-                        "titulo": raw_titulo,
-                        "loja": raw_loja,
-                        "link": raw_link,
-                        "data": datetime.now().isoformat()
-                    })
-        except Exception as e:
-            log_message(f"Erro ao processar cupom: {e}", "ERROR")
-
-    # Persistência
     save_posted_ids(posted_ids, POSTED_FILE)
-    save_posted_ids(cupons_ids, CUPONS_FILE)
-    save_site_data(ofertas_lista, cupons_lista)
-
-    log_message("=== Ciclo finalizado ===")
-
+    
+    bot_status["ultima_execucao"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bot_status["status"] = f"Aguardando ({INTERVALO_VERIFICACAO} min)..."
 
 def loop_principal():
-    log_message("Bot iniciado.")
-    keep_alive() # Inicia o servidor HTTP em background
-    
+    log_message("Thread do bot iniciada.")
     while True:
         try:
             executar_ciclo()
-            log_message(f"Aguardando {INTERVALO_VERIFICACAO} minutos...")
             time.sleep(INTERVALO_VERIFICACAO * 60)
-        except KeyboardInterrupt:
-            log_message("Encerrado manualmente.")
-            break
         except Exception as e:
-            log_message(f"Erro no loop de execução: {e}", "ERROR")
+            log_message(f"Erro no loop principal: {e}", "ERROR")
             time.sleep(60)
 
+# ============================================================================
+# FLASK WEB INTERFACE (Dashboard)
+# ============================================================================
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel de Controle - Bot Defensoria</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; padding-top: 20px; }
+        .card { box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .status-badge { font-size: 1.1em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2 class="mb-4">🤖 Painel do Bot de Ofertas</h2>
+        
+        <!-- Status do Bot -->
+        <div class="card">
+            <div class="card-header bg-dark text-white">Status do Sistema</div>
+            <div class="card-body">
+                <p><strong>Status Atual:</strong> <span class="badge bg-primary status-badge">{{ status.status }}</span></p>
+                <p><strong>Última Execução:</strong> {{ status.ultima_execucao }}</p>
+                <p><strong>Ofertas Enviadas Hoje:</strong> {{ status.ofertas_enviadas_hoje }}</p>
+            </div>
+        </div>
+
+        <!-- Configuração de Afiliados -->
+        <div class="card">
+            <div class="card-header bg-success text-white">Links de Afiliado</div>
+            <div class="card-body">
+                <form action="/update_tags" method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Tag Amazon</label>
+                        <input type="text" class="form-control" name="amazon_tag" value="{{ config.amazon_tag }}" placeholder="ex: seucodigo-20">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">UTM Source Mercado Livre (Outros)</label>
+                        <input type="text" class="form-control" name="mercado_livre_tag" value="{{ config.mercado_livre_tag }}" placeholder="ex: robo_ofertas">
+                    </div>
+                    <button type="submit" class="btn btn-success">Salvar Configurações</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Logs e Erros -->
+        <div class="card border-danger">
+            <div class="card-header bg-danger text-white">Últimos Erros (Logs)</div>
+            <div class="card-body">
+                <ul class="list-group">
+                    {% for erro in status.erros_recentes %}
+                        <li class="list-group-item text-danger">{{ erro }}</li>
+                    {% else %}
+                        <li class="list-group-item text-muted">Nenhum erro registrado recentemente.</li>
+                    {% endfor %}
+                </ul>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    config = load_dynamic_config()
+    return render_template_string(HTML_TEMPLATE, config=config, status=bot_status)
+
+@app.route("/update_tags", methods=["POST"])
+def update_tags():
+    novo_config = {
+        "amazon_tag": request.form.get("amazon_tag", "").strip(),
+        "mercado_livre_tag": request.form.get("mercado_livre_tag", "").strip()
+    }
+    save_dynamic_config(novo_config)
+    return redirect("/")
+
+@app.route("/health")
+def health():
+    """Endpoint limpo para o UptimeRobot bater"""
+    return jsonify({"status": "online", "uptime": "ok"})
+
 if __name__ == "__main__":
-    loop_principal()
+    # Inicia a rotina de postagem em uma thread separada
+    thread_bot = threading.Thread(target=loop_principal, daemon=True)
+    thread_bot.start()
+
+    # Inicia o servidor web Dashboard na thread principal
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
