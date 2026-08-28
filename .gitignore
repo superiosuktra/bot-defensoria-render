@@ -43,4 +43,5 @@ logs/
 # Dados temporários
 postados.txt
 cupons_postados.txt
+mensagens_ativas.json
 dados.json
