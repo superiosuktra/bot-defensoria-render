@@ -44,14 +44,3 @@ Robô automático que busca ofertas e cupons em tempo real e envia para o Telegr
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 5️⃣ Executar
-
-```bash
-python bot_cloud.py
-```
-
-Acesse o painel em `http://localhost:8080` (ou na URL do seu deploy).
-
-## 📁 Estrutura
