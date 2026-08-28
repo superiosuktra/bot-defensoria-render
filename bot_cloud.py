@@ -24,6 +24,10 @@ Segurança:
 import os
 import time
 import json
+import hmac
+import socket
+import secrets
+import ipaddress
 import hashlib
 import threading
 from datetime import datetime
@@ -34,7 +38,7 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, request, render_template_string, redirect, jsonify, session
+from flask import Flask, request, render_template_string, redirect, jsonify, session, abort
 from functools import wraps
 
 load_dotenv()
@@ -69,6 +73,109 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.getenv("FLASK_ENV") == "production",
 )
 
+# ============================================================================
+# SEGURANÇA: HEADERS, CSRF E RATE LIMIT DE LOGIN
+# ============================================================================
+
+@app.after_request
+def add_security_headers(resp):
+    """Adiciona headers básicos contra clickjacking / MIME sniffing."""
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:;"
+    )
+    return resp
+
+
+def get_csrf_token() -> str:
+    """Gera (ou reaproveita) um token CSRF por sessão."""
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+    return session["csrf_token"]
+
+
+def csrf_protect(f):
+    """Exige token CSRF válido em requisições POST."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if request.method == "POST":
+            token_form = request.form.get("csrf_token", "")
+            token_sessao = session.get("csrf_token", "")
+            if not token_sessao or not hmac.compare_digest(token_form, token_sessao):
+                log_message("Bloqueado: token CSRF ausente ou inválido.", "ERROR")
+                abort(403)
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
+# Rate limiting simples (em memória) para tentativas de login por IP.
+LOGIN_MAX_TENTATIVAS = 5
+LOGIN_JANELA_SEGUNDOS = 300  # 5 minutos
+_login_tentativas: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def login_bloqueado(ip: str) -> bool:
+    agora = time.time()
+    with _login_lock:
+        tentativas = [t for t in _login_tentativas.get(ip, []) if agora - t < LOGIN_JANELA_SEGUNDOS]
+        _login_tentativas[ip] = tentativas
+        return len(tentativas) >= LOGIN_MAX_TENTATIVAS
+
+
+def registrar_falha_login(ip: str) -> None:
+    with _login_lock:
+        _login_tentativas.setdefault(ip, []).append(time.time())
+
+
+def limpar_tentativas_login(ip: str) -> None:
+    with _login_lock:
+        _login_tentativas.pop(ip, None)
+
+
+# ============================================================================
+# SEGURANÇA: PROTEÇÃO CONTRA SSRF NA VERIFICAÇÃO DE LINKS
+# ============================================================================
+
+def is_url_safe(url: str) -> bool:
+    """Bloqueia URLs que apontem para IPs privados/locais (proteção SSRF).
+
+    Usado antes de qualquer requisição a links vindos de fontes externas
+    (RSS, ofertas), já que esses links não são confiáveis.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+
+        # Resolve o hostname e verifica se algum IP resultante é privado/reservado.
+        infos = socket.getaddrinfo(hostname, None)
+        for info in infos:
+            ip_str = info[4][0]
+            ip_obj = ipaddress.ip_address(ip_str)
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_reserved
+                or ip_obj.is_multicast
+            ):
+                return False
+        return True
+    except Exception:
+        # Se não foi possível resolver/validar, trate como não-seguro.
+        return False
+
 bot_status = {
     "status": "Iniciando Sistema...",
     "is_paused": False,
@@ -101,23 +208,61 @@ def load_dynamic_config() -> dict:
                 # Garante chaves mínimas mesmo em arquivos antigos
                 data.setdefault("telegram_token", "")
                 data.setdefault("destinos_telegram", "")
-                data.setdefault("amazon_tag", "")
-                data.setdefault("mercado_livre_tag", "")
                 data.setdefault("rss_url", os.getenv("RSS_FEED_URL", "https://www.promobit.com.br/feed/"))
                 data.setdefault("intervalo", 120)
                 data.setdefault("blacklist", "internacional, usado, reembalado")
                 data.setdefault("whitelist", "")
+                data.setdefault("affiliate_stores", [])
+
+                # Migração automática do formato antigo (amazon_tag / mercado_livre_tag
+                # fixos no código) para a lista dinâmica de lojas.
+                migrou = False
+                if data.get("amazon_tag"):
+                    data["affiliate_stores"].append(
+                        {"nome": "Amazon", "dominio": "amazon.com.br", "param": "tag", "valor": data["amazon_tag"]}
+                    )
+                    data.pop("amazon_tag", None)
+                    migrou = True
+                if data.get("mercado_livre_tag"):
+                    data["affiliate_stores"].append(
+                        {
+                            "nome": "Mercado Livre",
+                            "dominio": "mercadolivre.com.br",
+                            "param": "utm_source",
+                            "valor": data["mercado_livre_tag"],
+                        }
+                    )
+                    data.pop("mercado_livre_tag", None)
+                    migrou = True
+                if migrou:
+                    save_dynamic_config(data)
+
                 return data
         except Exception as exc:
             log_message(f"Falha ao ler config.json, recriando: {exc}", "WARN")
+
+    # Lojas padrão pré-configuradas a partir do .env (opcional, retrocompatibilidade).
+    affiliate_stores = []
+    if os.getenv("AFFILIATE_TAG_AMAZON"):
+        affiliate_stores.append(
+            {"nome": "Amazon", "dominio": "amazon.com.br", "param": "tag", "valor": os.getenv("AFFILIATE_TAG_AMAZON")}
+        )
+    if os.getenv("AFFILIATE_TAG_OUTROS"):
+        affiliate_stores.append(
+            {
+                "nome": "Mercado Livre",
+                "dominio": "mercadolivre.com.br",
+                "param": "utm_source",
+                "valor": os.getenv("AFFILIATE_TAG_OUTROS"),
+            }
+        )
 
     default_config = {
         "telegram_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "destinos_telegram": (
             os.getenv("TELEGRAM_CANAIS", "") + "," + os.getenv("TELEGRAM_GRUPOS", "")
         ).strip(","),
-        "amazon_tag": os.getenv("AFFILIATE_TAG_AMAZON", ""),
-        "mercado_livre_tag": os.getenv("AFFILIATE_TAG_OUTROS", ""),
+        "affiliate_stores": affiliate_stores,
         "rss_url": os.getenv("RSS_FEED_URL", "https://www.promobit.com.br/feed/"),
         "intervalo": 120,
         "blacklist": "internacional, usado, reembalado",
@@ -232,25 +377,32 @@ def generate_unique_id(text: str, url: str) -> str:
 
 
 def convert_to_affiliate_link(url: str, config: dict) -> str:
-    """Adiciona tags de afiliado para Amazon / Mercado Livre quando aplicável."""
+    """Adiciona tag de afiliado quando o domínio do link bate com alguma loja
+    cadastrada dinamicamente no painel (config['affiliate_stores']).
+
+    Não é necessário alterar o código para adicionar uma loja nova: basta
+    cadastrar domínio + parâmetro + valor no painel web. O bot passa a
+    reconhecer e aplicar automaticamente no próximo ciclo.
+    """
     if not url or not isinstance(url, str):
         return url
     try:
         parsed = urlparse(url)
-        hostname = (parsed.netloc or "").lower()
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return url
 
-        if any(hostname == d or hostname.endswith(f".{d}") for d in ["amazon.com.br", "amazon.com"]):
-            tag = config.get("amazon_tag")
-            if tag:
-                q = parse_qs(parsed.query)
-                q["tag"] = [tag]
-                return urlunparse(parsed._replace(query=urlencode(q, doseq=True)))
+        for loja in config.get("affiliate_stores", []):
+            dominio = str(loja.get("dominio", "")).strip().lower().lstrip(".")
+            param = str(loja.get("param", "")).strip()
+            valor = str(loja.get("valor", "")).strip()
 
-        elif any(hostname == d or hostname.endswith(f".{d}") for d in ["mercadolivre.com.br", "mercadolivre.com"]):
-            utm = config.get("mercado_livre_tag")
-            if utm:
+            if not dominio or not param or not valor:
+                continue
+
+            if hostname == dominio or hostname.endswith(f".{dominio}"):
                 q = parse_qs(parsed.query)
-                q["utm_source"] = [utm]
+                q[param] = [valor]
                 return urlunparse(parsed._replace(query=urlencode(q, doseq=True)))
 
         return url
@@ -387,8 +539,24 @@ def verificar_links_mortos(config: dict) -> None:
                 ativas_para_manter.append(item)
                 continue
 
+            if not is_url_safe(link):
+                log_message(f"Link bloqueado por segurança (SSRF): {link}", "WARN")
+                ativas_para_manter.append(item)
+                continue
+
             try:
-                resp = requests.get(link, headers=headers, timeout=10, allow_redirects=True)
+                # allow_redirects=False evita que um redirect leve a um IP interno
+                # depois da checagem inicial (proteção SSRF via redirect).
+                resp = requests.get(link, headers=headers, timeout=10, allow_redirects=False)
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    destino = resp.headers.get("Location", "")
+                    if destino and is_url_safe(destino):
+                        resp = requests.get(destino, headers=headers, timeout=10, allow_redirects=False)
+                    else:
+                        log_message(f"Redirect bloqueado por segurança (SSRF): {link} -> {destino}", "WARN")
+                        ativas_para_manter.append(item)
+                        continue
+
                 if resp.status_code in (404, 410):
                     is_dead = True
                 elif resp.status_code == 200:
@@ -696,6 +864,7 @@ LOGIN_HTML = f"""
         <h3 class="text-center mb-4" style="color: var(--neon-cyan); text-shadow: 0 0 10px rgba(0,243,255,0.5); font-weight: 700;">SYS.LOGIN</h3>
         {{% if erro %}}<div class="alert alert-danger" style="background: rgba(255,0,60,0.2); border-color: var(--neon-red); color: #fff;">{{{{ erro }}}}</div>{{% endif %}}
         <form method="POST">
+            <input type="hidden" name="csrf_token" value="{{{{ csrf_token }}}}">
             <input type="password" name="senha" class="form-control mb-4 py-2" placeholder="[ INSIRA A SENHA DE ACESSO ]" required>
             <button class="btn btn-cyber w-100 py-2" type="submit">AUTENTICAR</button>
         </form>
@@ -741,6 +910,7 @@ DASHBOARD_HTML = f"""
                             </div>
                         </div>
                         <form action="/action/control" method="POST" class="d-flex justify-content-center gap-3 flex-wrap">
+                            <input type="hidden" name="csrf_token" value="{{{{ csrf_token }}}}">
                             <button name="action" value="toggle_pause" class="btn btn-cyber-warning px-4" id="btn-pause">⏸ PAUSAR SISTEMA</button>
                             <button name="action" value="force_run" class="btn btn-cyber px-4">▶ FORÇAR RASPAGEM</button>
                             <button name="action" value="check_dead_links" class="btn btn-cyber-danger px-4">🧹 LIMPAR ESGOTADOS</button>
@@ -762,11 +932,12 @@ DASHBOARD_HTML = f"""
                         <span style="color: #fff;">MÓDULO:</span> CONFIG_DINÂMICA
                     </div>
                     <div class="card-body p-4">
-                        <form action="/update_config" method="POST">
+                        <form action="/update_config" method="POST" id="form-config">
+                            <input type="hidden" name="csrf_token" value="{{{{ csrf_token }}}}">
                             <h6 class="text-muted mb-3" style="letter-spacing: 1px;">// REDE TELEGRAM</h6>
                             <div class="mb-3">
                                 <label class="form-label">BOT TOKEN (API KEY)</label>
-                                <input type="password" class="form-control" name="telegram_token" value="{{{{ config.telegram_token }}}}" placeholder="[ PROTEGIDO ]">
+                                <input type="password" class="form-control" name="telegram_token" value="" placeholder="[ PREENCHIDO — deixe em branco para manter ]" autocomplete="new-password">
                             </div>
                             <div class="mb-4">
                                 <label class="form-label">IDs DE DESTINO (CHATS)</label>
@@ -779,19 +950,18 @@ DASHBOARD_HTML = f"""
                                 <input type="number" class="form-control w-25 text-center" name="intervalo" value="{{{{ config.intervalo }}}}">
                             </div>
 
-                            <h6 class="text-muted mb-3" style="letter-spacing: 1px;">// ROTAS DE AFILIADO</h6>
-                            <div class="row mb-4">
-                                <div class="col-6">
-                                    <label class="form-label">AMAZON TAG</label>
-                                    <input type="text" class="form-control" name="amazon_tag" value="{{{{ config.amazon_tag }}}}">
-                                </div>
-                                <div class="col-6">
-                                    <label class="form-label">MERCADO LIVRE (UTM)</label>
-                                    <input type="text" class="form-control" name="mercado_livre_tag" value="{{{{ config.mercado_livre_tag }}}}">
-                                </div>
-                            </div>
+                            <h6 class="text-muted mb-3 d-flex justify-content-between align-items-center" style="letter-spacing: 1px;">
+                                <span>// LOJAS DE AFILIADO (DINÂMICO)</span>
+                                <button type="button" class="btn btn-cyber-success btn-sm" onclick="adicionarLoja()">+ ADICIONAR LOJA</button>
+                            </h6>
+                            <p class="text-muted" style="font-size: 0.78rem;">
+                                Cadastre aqui qualquer loja nova. O bot detecta o domínio automaticamente
+                                nos links das ofertas e aplica o parâmetro de afiliado — sem precisar mexer no código.
+                            </p>
+                            <div id="lojas-container" class="mb-3"></div>
+                            <input type="hidden" name="affiliate_stores_json" id="affiliate_stores_json">
 
-                            <h6 class="text-muted mb-3" style="letter-spacing: 1px;">// ALGORITMO DE FILTRAGEM</h6>
+                            <h6 class="text-muted mb-3 mt-4" style="letter-spacing: 1px;">// ALGORITMO DE FILTRAGEM</h6>
                             <div class="mb-3">
                                 <label class="form-label" style="color: var(--neon-red);">BLACKLIST (DESCARTAR)</label>
                                 <input type="text" class="form-control" name="blacklist" value="{{{{ config.blacklist }}}}" placeholder="ex: internacional, usado">
@@ -810,6 +980,61 @@ DASHBOARD_HTML = f"""
     </div>
 
     <script>
+        // ------------------------------------------------------------------
+        // LOJAS DE AFILIADO — cadastro dinâmico (sem alterar código-fonte)
+        // ------------------------------------------------------------------
+        var lojasAfiliado = {{{{ affiliate_stores_json }}}};
+
+        function renderLojas() {{
+            const container = document.getElementById('lojas-container');
+            container.innerHTML = '';
+            if (lojasAfiliado.length === 0) {{
+                container.innerHTML = '<p class="text-muted" style="font-size:0.8rem;">Nenhuma loja cadastrada ainda.</p>';
+            }}
+            lojasAfiliado.forEach(function(loja, idx) {{
+                const row = document.createElement('div');
+                row.className = 'row mb-2 align-items-center';
+                row.innerHTML = `
+                    <div class="col-3">
+                        <input type="text" class="form-control form-control-sm" placeholder="Nome (ex: Shopee)"
+                            value="${{loja.nome || ''}}" oninput="lojasAfiliado[${{idx}}].nome=this.value">
+                    </div>
+                    <div class="col-3">
+                        <input type="text" class="form-control form-control-sm" placeholder="dominio.com.br"
+                            value="${{loja.dominio || ''}}" oninput="lojasAfiliado[${{idx}}].dominio=this.value">
+                    </div>
+                    <div class="col-2">
+                        <input type="text" class="form-control form-control-sm" placeholder="parâmetro (ex: tag)"
+                            value="${{loja.param || ''}}" oninput="lojasAfiliado[${{idx}}].param=this.value">
+                    </div>
+                    <div class="col-3">
+                        <input type="text" class="form-control form-control-sm" placeholder="seu código de afiliado"
+                            value="${{loja.valor || ''}}" oninput="lojasAfiliado[${{idx}}].valor=this.value">
+                    </div>
+                    <div class="col-1 text-end">
+                        <button type="button" class="btn btn-cyber-danger btn-sm" onclick="removerLoja(${{idx}})">✕</button>
+                    </div>
+                `;
+                container.appendChild(row);
+            }});
+        }}
+
+        function adicionarLoja() {{
+            lojasAfiliado.push({{nome: '', dominio: '', param: 'tag', valor: ''}});
+            renderLojas();
+        }}
+
+        function removerLoja(idx) {{
+            lojasAfiliado.splice(idx, 1);
+            renderLojas();
+        }}
+
+        document.getElementById('form-config').addEventListener('submit', function() {{
+            document.getElementById('affiliate_stores_json').value = JSON.stringify(lojasAfiliado);
+        }});
+
+        renderLojas();
+
         function fetchStatus() {{
             fetch('/api/data')
                 .then(response => response.json())
@@ -861,17 +1086,37 @@ def login_required(f):
 
 @app.route("/login", methods=["GET", "POST"])
 def login() -> str:
+    ip_cliente = request.remote_addr or "desconhecido"
+
     if request.method == "POST":
+        if login_bloqueado(ip_cliente):
+            log_message(f"Login bloqueado temporariamente por excesso de tentativas: {ip_cliente}", "ERROR")
+            return render_template_string(
+                LOGIN_HTML,
+                erro="MUITAS TENTATIVAS. AGUARDE ALGUNS MINUTOS.",
+                csrf_token=get_csrf_token(),
+            ), 429
+
+        token_form = request.form.get("csrf_token", "")
+        token_sessao = session.get("csrf_token", "")
         senha = request.form.get("senha", "")
-        if senha == PAINEL_PASSWORD:
+
+        senha_ok = bool(token_sessao) and hmac.compare_digest(token_form, token_sessao)
+        senha_ok = senha_ok and hmac.compare_digest(senha, PAINEL_PASSWORD)
+
+        if senha_ok:
+            limpar_tentativas_login(ip_cliente)
             # Regenera sessão para evitar fixation
             session.clear()
             session["logged_in"] = True
             log_message("Acesso autorizado ao painel de controle.", "INFO")
             return redirect("/")
-        log_message("Tentativa de acesso não autorizada.", "WARN")
-        return render_template_string(LOGIN_HTML, erro="ACESSO NEGADO: SENHA INCORRETA")
-    return render_template_string(LOGIN_HTML)
+
+        registrar_falha_login(ip_cliente)
+        log_message(f"Tentativa de acesso não autorizada de {ip_cliente}.", "WARN")
+        return render_template_string(LOGIN_HTML, erro="ACESSO NEGADO: SENHA INCORRETA", csrf_token=get_csrf_token())
+
+    return render_template_string(LOGIN_HTML, csrf_token=get_csrf_token())
 
 
 @app.route("/logout")
@@ -884,7 +1129,14 @@ def logout() -> str:
 @login_required
 def index() -> str:
     config = load_dynamic_config()
-    return render_template_string(DASHBOARD_HTML, config=config)
+    # Escapa "</" para não permitir que dados salvos quebrem a tag <script> no HTML.
+    stores_json = json.dumps(config.get("affiliate_stores", []), ensure_ascii=False).replace("</", "<\\/")
+    return render_template_string(
+        DASHBOARD_HTML,
+        config=config,
+        affiliate_stores_json=stores_json,
+        csrf_token=get_csrf_token(),
+    )
 
 
 @app.route("/api/data")
@@ -896,33 +1148,75 @@ def api_data():
     return jsonify({"status": bot_status, "logs": logs_copia})
 
 
+MAX_LOJAS_AFILIADO = 30
+
+
+def parse_affiliate_stores(raw_json: str) -> list[dict]:
+    """Valida e normaliza a lista de lojas de afiliado enviada pelo painel."""
+    lojas: list[dict] = []
+    try:
+        bruto = json.loads(raw_json) if raw_json else []
+    except (TypeError, ValueError):
+        log_message("JSON de lojas de afiliado inválido — ignorando alterações nessa lista.", "WARN")
+        return lojas
+
+    if not isinstance(bruto, list):
+        return lojas
+
+    for item in bruto[:MAX_LOJAS_AFILIADO]:
+        if not isinstance(item, dict):
+            continue
+        nome = str(item.get("nome", "")).strip()[:60]
+        dominio = str(item.get("dominio", "")).strip().lower().lstrip(".")[:120]
+        param = str(item.get("param", "")).strip()[:60]
+        valor = str(item.get("valor", "")).strip()[:200]
+
+        # Domínio minimamente válido (sem espaços, sem esquema/protocolo).
+        if not dominio or " " in dominio or "/" in dominio or not param or not valor:
+            continue
+
+        lojas.append({"nome": nome or dominio, "dominio": dominio, "param": param, "valor": valor})
+
+    return lojas
+
+
 @app.route("/update_config", methods=["POST"])
 @login_required
+@csrf_protect
 def update_config():
     try:
         novo_intervalo = int(request.form.get("intervalo", 120))
     except (TypeError, ValueError):
         novo_intervalo = 120
 
+    atual = load_dynamic_config()
+
+    # Mantém o token atual se o campo vier vazio (evita apagar o token
+    # sem querer, já que o valor real não é mais renderizado no formulário).
+    token_enviado = request.form.get("telegram_token", "").strip()
+    novo_token = token_enviado if token_enviado else atual.get("telegram_token", "")
+
     novo_config = {
-        "telegram_token": request.form.get("telegram_token", "").strip(),
+        "telegram_token": novo_token,
         "destinos_telegram": request.form.get("destinos_telegram", "").strip(),
         "intervalo": novo_intervalo,
-        "amazon_tag": request.form.get("amazon_tag", "").strip(),
-        "mercado_livre_tag": request.form.get("mercado_livre_tag", "").strip(),
+        "affiliate_stores": parse_affiliate_stores(request.form.get("affiliate_stores_json", "[]")),
         "blacklist": request.form.get("blacklist", "").strip(),
         "whitelist": request.form.get("whitelist", "").strip(),
+        "rss_url": atual.get("rss_url", "https://www.promobit.com.br/feed/"),
     }
-    atual = load_dynamic_config()
-    novo_config["rss_url"] = atual.get("rss_url", "https://www.promobit.com.br/feed/")
 
     save_dynamic_config(novo_config)
-    log_message("Parâmetros do sistema reconfigurados com sucesso.", "INFO")
+    log_message(
+        f"Parâmetros reconfigurados. {len(novo_config['affiliate_stores'])} loja(s) de afiliado ativa(s).",
+        "INFO",
+    )
     return redirect("/")
 
 
 @app.route("/action/control", methods=["POST"])
 @login_required
+@csrf_protect
 def bot_control():
     action = request.form.get("action")
     if action == "toggle_pause":
