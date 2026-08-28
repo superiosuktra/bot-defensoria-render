@@ -14,7 +14,7 @@ Auto-Clean : Verifica ofertas ativas e marcas como encerradas no Telegram
 
 Deduplicação : Não envie a mesma oferta 2 vezes
 
-Afiliados : Suporte a links de afiliados (Amazon, Mercado Livre)
+Afiliados Dinâmicos : Cadastre qualquer loja nova pelo painel (domínio + parâmetro + código) — o bot passa a aplicar automaticamente, sem precisar mexer no código
 
 Filtros : Blacklist e whitelist personalizáveis
 
@@ -64,10 +64,39 @@ bash
 python bot_cloud.py
 acesse o painel em:http://localhost:8080
 
-🔐 Segurança
-Segredos apenas em variáveis ​​de ambiente ( .env)
+🏪 Adicionando uma loja de afiliado nova (sem tocar no código)
+No painel web, seção CONFIG_DINÂMICA → LOJAS DE AFILIADO (DINÂMICO):
 
-Painel protegido por senha e sessão Flask duradoura
+Clique em + ADICIONAR LOJA
+
+Preencha:
+
+Nome: só um rótulo (ex: "Shopee")
+
+Domínio: domínio do site, sem https:// (ex: shopee.com.br)
+
+Parâmetro: nome do parâmetro de URL que a loja usa para rastrear afiliados (ex: tag, utm_source, af_id — cada loja tem o seu, veja no seu link de afiliado gerado pela própria loja)
+
+Código: o valor do seu código de afiliado
+
+Clique em GRAVAR PARÂMETROS
+
+A partir do próximo ciclo, qualquer link de oferta cujo domínio bata com o cadastrado recebe automaticamente o parâmetro de afiliado. Pode cadastrar quantas lojas quiser, remover com o ✕, tudo fica salvo em config.json.
+
+🔐 Segurança
+Segredos apenas em variáveis ​​de ambiente ( .env) ou em config.json (nunca versionado — veja .gitignore)
+
+Painel protegido por senha (comparação resistente a timing attack) e sessão Flask
+
+Rate limiting: após 5 tentativas de login erradas, o IP fica bloqueado por 5 minutos
+
+Proteção CSRF em todos os formulários que alteram estado (login, config, controles do bot)
+
+Token do Telegram nunca é reexibido no HTML do painel (campo fica em branco; só é alterado se você digitar um novo valor)
+
+Proteção contra SSRF: antes de o bot verificar se um link de oferta "morreu", o domínio é resolvido e IPs privados/locais/metadata (127.0.0.1, 192.168.x.x, 169.254.169.254 etc.) são bloqueados — impede que um feed RSS malicioso force o servidor a acessar sua própria rede interna
+
+Headers de segurança (X-Frame-Options, Content-Security-Policy, X-Content-Type-Options) contra clickjacking e MIME sniffing
 
 Cookies de sessão marcada como HttpOnlye SameSite=Laxpor padrão
 
