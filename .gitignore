@@ -40,7 +40,8 @@ wheels/
 *.log
 logs/
 
-# Dados temporários
+# Dados temporários / sensíveis (contém token do Telegram e tags de afiliado)
+config.json
 postados.txt
 cupons_postados.txt
 mensagens_ativas.json
