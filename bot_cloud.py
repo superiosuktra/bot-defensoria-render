@@ -104,6 +104,7 @@ def load_config():
     data.setdefault("blacklist", "internacional, usado, reembalado")
     data.setdefault("whitelist", "")
     data.setdefault("panel_password", "")
+    data.setdefault("panel_users", {})
     data.setdefault("amazon_tag", "")
     data.setdefault("mercado_livre_tag", "")
     return data
@@ -139,6 +140,21 @@ def save_posted_ids(ids):
 def generate_unique_id(text, url):
     base = (text.strip() + "|" + url.strip()).lower().encode("utf-8")
     return hashlib.sha256(base).hexdigest()[:16]
+
+
+def get_panel_users(config):
+    users = config.get("panel_users", {})
+    clean_users = {}
+    if isinstance(users, dict):
+        for username, password in users.items():
+            uname = str(username).strip()
+            passwd = str(password)
+            if uname and passwd:
+                clean_users[uname] = passwd
+    legacy_password = str(config.get("panel_password", "")).strip()
+    if legacy_password and "admin" not in clean_users:
+        clean_users["admin"] = legacy_password
+    return clean_users
 
 
 def pass_filters(titulo, config):
@@ -325,6 +341,10 @@ LOGIN_HTML = '''
       <form method="post">
         {% if setup %}
           <div class="mb-3">
+            <label class="form-label">Usuário administrador</label>
+            <input type="text" name="usuario_novo" class="form-control" required>
+          </div>
+          <div class="mb-3">
             <label class="form-label">Nova senha</label>
             <input type="password" name="senha_nova" class="form-control" required>
           </div>
@@ -333,6 +353,10 @@ LOGIN_HTML = '''
             <input type="password" name="senha_conf" class="form-control" required>
           </div>
         {% else %}
+          <div class="mb-3">
+            <label class="form-label">Usuário</label>
+            <input type="text" name="usuario" class="form-control" required>
+          </div>
           <div class="mb-3">
             <label class="form-label">Senha</label>
             <input type="password" name="senha" class="form-control" required>
@@ -361,6 +385,7 @@ DASHBOARD_HTML = '''
   <div class="container-fluid">
     <span class="navbar-brand">Mega Deals // Console</span>
     <div class="d-flex gap-2">
+      <span class="navbar-text">Usuário: {{ current_user }}</span>
       <a href="/logout" class="btn btn-sm btn-outline-light">Sair</a>
     </div>
   </div>
@@ -412,6 +437,39 @@ DASHBOARD_HTML = '''
           </form>
         </div>
       </div>
+      <div class="card bg-secondary mt-4">
+        <div class="card-header">Acesso do painel</div>
+        <div class="card-body">
+          <form method="post" action="/manage_users">
+            <input type="hidden" name="action" value="add_or_update">
+            <div class="mb-3">
+              <label class="form-label">Usuário</label>
+              <input type="text" name="username" class="form-control" required>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Senha</label>
+              <input type="password" name="password" class="form-control" required>
+            </div>
+            <button class="btn btn-info" type="submit">Adicionar/Atualizar usuário</button>
+          </form>
+          <hr>
+          <p class="mb-2"><strong>Usuários cadastrados:</strong></p>
+          {% for user in panel_users %}
+            <form method="post" action="/manage_users" class="d-flex justify-content-between align-items-center mb-2">
+              <input type="hidden" name="action" value="delete">
+              <input type="hidden" name="username" value="{{ user }}">
+              <span>{{ user }}</span>
+              {% if user == current_user %}
+                <button class="btn btn-sm btn-outline-light" type="button" disabled>Usuário atual</button>
+              {% elif panel_users|length == 1 %}
+                <button class="btn btn-sm btn-outline-light" type="button" disabled>Último usuário</button>
+              {% else %}
+                <button class="btn btn-sm btn-danger" type="submit">Remover</button>
+              {% endif %}
+            </form>
+          {% endfor %}
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -451,32 +509,44 @@ def login_required(f):
 @app.route("/login", methods=["GET", "POST"])
 def login():
     cfg = load_config()
-    panel_password = cfg.get("panel_password", "")
-    setup = not bool(panel_password)
+    panel_users = get_panel_users(cfg)
+    setup = not bool(panel_users)
     error = None
 
     if request.method == "POST":
         if setup:
+            usuario_novo = request.form.get("usuario_novo", "").strip()
             nova = request.form.get("senha_nova", "")
             conf = request.form.get("senha_conf", "")
-            if not nova or nova != conf:
+            if not usuario_novo:
+                error = "Usuário é obrigatório."
+            elif not nova or nova != conf:
                 error = "Senhas não conferem."
             else:
-                cfg["panel_password"] = nova
+                cfg["panel_users"] = {usuario_novo: nova}
+                cfg["panel_password"] = ""
                 save_config(cfg)
                 session.clear()
                 session["logged_in"] = True
+                session["username"] = usuario_novo
                 log_message("Senha do painel definida.", "INFO")
                 return redirect("/")
         else:
+            usuario = request.form.get("usuario", "").strip()
             senha = request.form.get("senha", "")
-            if senha == panel_password:
+            senha_salva = panel_users.get(usuario)
+            if senha_salva and secrets.compare_digest(str(senha), str(senha_salva)):
+                if not cfg.get("panel_users"):
+                    cfg["panel_users"] = panel_users
+                    cfg["panel_password"] = ""
+                    save_config(cfg)
                 session.clear()
                 session["logged_in"] = True
+                session["username"] = usuario
                 log_message("Login autorizado.", "INFO")
                 return redirect("/")
             else:
-                error = "Senha incorreta."
+                error = "Usuário ou senha incorretos."
 
     return render_template_string(LOGIN_HTML, setup=setup, error=error)
 
@@ -485,13 +555,51 @@ def login():
 @login_required
 def index():
     cfg = load_config()
-    return render_template_string(DASHBOARD_HTML, cfg=cfg)
+    panel_users = sorted(get_panel_users(cfg).keys())
+    return render_template_string(
+        DASHBOARD_HTML,
+        cfg=cfg,
+        panel_users=panel_users,
+        current_user=session.get("username", "desconhecido"),
+    )
 
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect("/login")
+
+
+@app.route("/manage_users", methods=["POST"])
+@login_required
+def manage_users():
+    cfg = load_config()
+    panel_users = get_panel_users(cfg)
+    action = request.form.get("action", "")
+    if action == "add_or_update":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if username and password:
+            panel_users[username] = password
+            cfg["panel_users"] = panel_users
+            cfg["panel_password"] = ""
+            save_config(cfg)
+            log_message("Usuário do painel adicionado/atualizado: %s" % username, "INFO")
+    elif action == "delete":
+        username = request.form.get("username", "").strip()
+        current_user = session.get("username", "")
+        if username and username in panel_users:
+            if username == current_user:
+                log_message("Remoção bloqueada: usuário atual.", "WARN")
+            elif len(panel_users) <= 1:
+                log_message("Remoção bloqueada: é necessário manter ao menos 1 usuário.", "WARN")
+            else:
+                panel_users.pop(username, None)
+                cfg["panel_users"] = panel_users
+                cfg["panel_password"] = ""
+                save_config(cfg)
+                log_message("Usuário do painel removido: %s" % username, "INFO")
+    return redirect("/")
 
 
 @app.route("/api/data")

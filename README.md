@@ -10,6 +10,8 @@ Telegram : Envio para canais e grupos
 
 Dashboard Web : Controle via navegador (pausa, forçar ciclo, limpeza automática)
 
+Acesso Multiusuário : Vários logins diferentes podem acessar o mesmo painel
+
 Auto-Clean : Verifica ofertas ativas e marcas como encerradas no Telegram
 
 Deduplicação : Não envie a mesma oferta 2 vezes
@@ -87,6 +89,8 @@ A partir do próximo ciclo, qualquer link de oferta cujo domínio bata com o cad
 Segredos apenas em variáveis ​​de ambiente ( .env) ou em config.json (nunca versionado — veja .gitignore)
 
 Painel protegido por senha (comparação resistente a timing attack) e sessão Flask
+
+Suporte a múltiplos usuários de painel (cada um com seu próprio login/senha)
 
 Rate limiting: após 5 tentativas de login erradas, o IP fica bloqueado por 5 minutos
 
