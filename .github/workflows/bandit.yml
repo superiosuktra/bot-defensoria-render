@@ -50,3 +50,20 @@ jobs:
           # path to a .bandit file that supplies command line arguments
           # ini_path: # optional, default is DEFAULT
 
+      # Adiciona etapas para gerar um relatório JSON do Bandit e subir como artifact,
+      # para permitir download/inspeção do resultado fora do UI do code scanning.
+      - name: Instalar Bandit CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit
+
+      - name: Gerar relatório do Bandit (JSON)
+        run: |
+          # Executa varredura recursiva e salva resultado em JSON (não falhar o job)
+          bandit -r . -f json -o bandit-report.json || true
+
+      - name: Upload do relatório do Bandit como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
