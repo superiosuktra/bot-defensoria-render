@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from flask import Flask, request, render_template_string, redirect, jsonify, session
 from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # ======================================================================
 # CONFIGURAÇÃO
@@ -137,7 +138,10 @@ def save_posted_ids(ids):
 
 
 def generate_unique_id(text, url):
-    base = (text.strip() + "|" + url.strip()).lower().encode("utf-8")
+    # Garantir que text e url sejam strings (evita AttributeError sobre .strip() quando forem None)
+    t = "" if text is None else str(text)
+    u = "" if url is None else str(url)
+    base = (t.strip() + "|" + u.strip()).lower().encode("utf-8")
     return hashlib.sha256(base).hexdigest()[:16]
 
 
@@ -233,18 +237,24 @@ def executar_ciclo():
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(rss_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            log_message("Falha ao buscar RSS: status_code=%s" % resp.status_code, "ERROR")
+            bot_status["status"] = "Erro ao buscar RSS"
+            return
         feed = feedparser.parse(resp.content)
     except Exception as exc:
         log_message("Falha ao buscar RSS: %s" % exc, "ERROR")
-        bot_status["status"] = "Sistema Operacional"
+        bot_status["status"] = "Erro ao buscar RSS"
         return
 
     novos = 0
 
-    for entry in reversed(feed.entries):
+    for entry in reversed(getattr(feed, "entries", [])):
         titulo = entry.get("title", "Oferta")
-        link = entry.get("link", "").strip()
-        entry_id = entry.get("id") or link
+        # garantir string antes de strip() para evitar AttributeError se entry.get("link") for None
+        link = str(entry.get("link") or "").strip()
+        # entry_id deve ser string (evitar None)
+        entry_id = str(entry.get("id") or link or "")
         uid = generate_unique_id(titulo, entry_id)
 
         if uid in posted_ids or not link.startswith("http"):
@@ -462,7 +472,8 @@ def login():
             if not nova or nova != conf:
                 error = "Senhas não conferem."
             else:
-                cfg["panel_password"] = nova
+                # salvar hash da senha (melhora a segurança)
+                cfg["panel_password"] = generate_password_hash(nova)
                 save_config(cfg)
                 session.clear()
                 session["logged_in"] = True
@@ -470,7 +481,8 @@ def login():
                 return redirect("/")
         else:
             senha = request.form.get("senha", "")
-            if senha == panel_password:
+            # verificar hash salvo
+            if panel_password and check_password_hash(panel_password, senha):
                 session.clear()
                 session["logged_in"] = True
                 log_message("Login autorizado.", "INFO")
